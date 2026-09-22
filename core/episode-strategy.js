@@ -20,6 +20,58 @@ import { getEpisodes as animeonsenEpisodes } from "../providers/animeonsen.js";
 const inflight  = new Map();
 const bgRunning = new Set();
 
+// Timeout por provedor: um scraper pendurado (ex: captcha/retry) não pode
+// segurar a resposta inteira — Promise.all espera o mais lento.
+// Env: PROVIDER_TIMEOUT_MS (padrão 15000).
+const PROVIDER_TIMEOUT_MS = (() => {
+  const n = Number(process?.env?.PROVIDER_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 15000;
+})();
+
+function timeoutError(label, ms) {
+  const e = new Error(`[ep:${label}] timeout after ${ms}ms`);
+  e.code = "PROVIDER_TIMEOUT";
+  return e;
+}
+
+function withTimeout(promise, label, ms = PROVIDER_TIMEOUT_MS) {
+  let t;
+  const guard = new Promise((_, reject) => {
+    t = setTimeout(() => reject(timeoutError(label, ms)), ms);
+  });
+  return Promise.finally ? Promise.race([promise, guard]).finally(() => clearTimeout(t))
+    : Promise.race([promise, guard]).then(
+        (v) => { clearTimeout(t); return v; },
+        (e) => { clearTimeout(t); throw e; },
+      );
+}
+
+// Cache em memória SEMPRE ligado (independe de CACHE_ENABLED, que controla
+// disco/Redis). Sem isso, cada /episodes re-scrapeia tudo ao vivo.
+// TTL curto: 5 min — suficiente para navegar entre episódios sem re-scrapear.
+const MEM_TTL_MS = 5 * 60 * 1000;
+const MEM_MAX = 300;
+const memFast = new Map();
+
+function memFastGet(key) {
+  const e = memFast.get(key);
+  if (!e) return null;
+  if (Date.now() > e.expiresAt) {
+    memFast.delete(key);
+    return null;
+  }
+  return e.data;
+}
+
+function memFastSet(key, data, ttlMs = MEM_TTL_MS) {
+  memFast.delete(key);
+  memFast.set(key, { data, expiresAt: Date.now() + ttlMs });
+  if (memFast.size > MEM_MAX) {
+    const first = memFast.keys().next().value;
+    memFast.delete(first);
+  }
+}
+
 function dedupe(key, fn) {
   if (inflight.has(key)) return inflight.get(key);
   const p = Promise.resolve().then(fn).finally(() => inflight.delete(key));
@@ -37,22 +89,35 @@ function bg(key, fn) {
 }
 
 async function withCache(key, status, fetchFn) {
-  const [ttl, refreshAfter] = episodeTTL(status);
-  const entry = await getAsync(key);
+  // 1) Cache rápido sempre-ligado (memória, 5 min).
+  const fast = memFastGet(key);
+  if (fast) return fast;
 
-  if (isFresh(entry)) {
-    if (needsRefresh(entry)) {
-      bg(key, async () => {
-        const data = await fetchFn();
-        await setAsync(key, data, ttl, refreshAfter);
-      });
+  // 2) Dedupe: requisições concorrentes da mesma chave dividem um scrape só
+  // (antes, 5 abas = 5 scrapes simultâneos do mesmo anime).
+  return dedupe(key, async () => {
+    const recheck = memFastGet(key);
+    if (recheck) return recheck;
+    const [ttl, refreshAfter] = episodeTTL(status);
+    const entry = await getAsync(key);
+
+    if (isFresh(entry)) {
+      memFastSet(key, entry.data);
+      if (needsRefresh(entry)) {
+        bg(key, async () => {
+          const data = await withTimeout(fetchFn(), key);
+          memFastSet(key, data);
+          await setAsync(key, data, ttl, refreshAfter);
+        });
+      }
+      return entry.data;
     }
-    return entry.data;
-  }
 
-  const data = await fetchFn();
-  await setAsync(key, data, ttl, refreshAfter);
-  return data;
+    const data = await withTimeout(fetchFn(), key);
+    memFastSet(key, data);
+    await setAsync(key, data, ttl, refreshAfter);
+    return data;
+  });
 }
 
 function orderEpisodeFields(data) {
@@ -72,7 +137,7 @@ function orderEpisodeFields(data) {
 }
 
 async function safe(label, fn) {
-  try   { return { ok: true,  data: orderEpisodeFields(await fn()) }; }
+  try   { return { ok: true,  data: orderEpisodeFields(await withTimeout(fn(), label)) }; }
   catch (e) { console.error(`[ep:${label}]`, e.message); return { ok: false, error: e.message, stack: e.stack }; }
 }
 
@@ -126,18 +191,30 @@ function providerFns(anilistId, status, ctx) {
 }
 
 export async function buildFilteredEpisodesWithCache(anilistId, providers, media, anizip) {
-  const status = media?.status ?? "RELEASING";
-  const ctx  = { media, anizip, maxPages: undefined };
-  const fns  = providerFns(anilistId, status, ctx);
+  const names = [...providers].sort();
+  const aggKey = `epf:${names.join(",")}:${anilistId}`;
+  const hit = memFastGet(aggKey);
+  if (hit) return hit;
 
-  const pairs = await Promise.all(
-    [...providers].map(async (name) => {
-      const result = await safe(name, fns[name]);
-      return [name, result.ok ? result.data : { error: result.error, stack: result.stack }];
-    })
-  );
+  // Dedupe agregado: mesma combinação em voo compartilha o resultado.
+  return dedupe(aggKey, async () => {
+    const recheck = memFastGet(aggKey);
+    if (recheck) return recheck;
+    const status = media?.status ?? "RELEASING";
+    const ctx  = { media, anizip, maxPages: undefined };
+    const fns  = providerFns(anilistId, status, ctx);
 
-  return Object.fromEntries(pairs);
+    const pairs = await Promise.all(
+      names.map(async (name) => {
+        const result = await safe(name, fns[name]);
+        return [name, result.ok ? result.data : { error: result.error, stack: result.stack }];
+      })
+    );
+
+    const out = Object.fromEntries(pairs);
+    memFastSet(aggKey, out);
+    return out;
+  });
 }
 
 export async function buildEpisodesWithCache(anilistId, media, anizip) {
