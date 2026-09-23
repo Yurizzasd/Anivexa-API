@@ -36,6 +36,94 @@ function rewriteRequest(request, newPath) {
   return new Request(u.toString(), { method: request.method, headers: request.headers });
 }
 
+function proxyPlaylist(text, base, selfBase, ref) {
+  const abs = (uri) => {
+    try {
+      return new URL(uri, base).toString();
+    } catch {
+      return null;
+    }
+  };
+  const proxied = (u) => `${selfBase}/p?u=${encodeURIComponent(u)}${ref ? `&ref=${encodeURIComponent(ref)}` : ""}`;
+  return String(text)
+    .split("\n")
+    .map((line) => {
+      const t = line.trim();
+      if (!t) return line;
+      if (t.startsWith("#")) {
+        return line.replace(/URI="([^"]+)"/g, (m2, g) => {
+          const a = abs(g);
+          return a ? `URI="${proxied(a)}"` : m2;
+        });
+      }
+      const a = abs(t);
+      return a ? proxied(a) : line;
+    })
+    .join("\n");
+}
+
+async function proxyStream(request) {
+  const url = new URL(request.url);
+  const target = url.searchParams.get("u") || "";
+  const ref = url.searchParams.get("ref") || "";
+  let upstreamUrl;
+  try {
+    upstreamUrl = new URL(target);
+  } catch {
+    return json({ error: "Parâmetro u inválido." }, 400);
+  }
+  if (upstreamUrl.protocol !== "http:" && upstreamUrl.protocol !== "https:") {
+    return json({ error: "URL não permitida." }, 400);
+  }
+
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    Accept: "*/*",
+  };
+  if (ref) {
+    headers.Referer = ref;
+    try {
+      headers.Origin = new URL(ref).origin;
+    } catch {}
+  }
+  const range = request.headers.get("Range");
+  if (range) headers.Range = range;
+
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const upstream = await fetch(upstreamUrl.toString(), { headers, signal: ctrl.signal });
+    if (!upstream.ok && upstream.status !== 206) {
+      return json({ error: `Upstream HTTP ${upstream.status}.` }, 502);
+    }
+    const outHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
+      "Cache-Control": "public, max-age=60",
+    };
+    const contentType = upstream.headers.get("Content-Type") || "";
+    const selfBase = `${url.protocol}//${url.host}`;
+    if (/mpegurl|vnd\.apple|x-mpegurl/i.test(contentType) || /\.m3u8($|\?)/i.test(upstreamUrl.pathname + upstreamUrl.search)) {
+      const text = await upstream.text();
+      outHeaders["Content-Type"] = "application/vnd.apple.mpegurl";
+      return new Response(proxyPlaylist(text, upstreamUrl.toString(), selfBase, ref), {
+        status: 200,
+        headers: outHeaders,
+      });
+    }
+    for (const h of ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"]) {
+      const v = upstream.headers.get(h);
+      if (v) outHeaders[h] = v;
+    }
+    return new Response(upstream.body, { status: upstream.status, headers: outHeaders });
+  } catch (e) {
+    return json({ error: "Falha ao buscar stream.", detail: String(e?.message || e) }, 502);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 const watchInflight = new Map();
 const SIGNED_STREAM_WATCH_TTL = 60_000;
 
@@ -286,6 +374,15 @@ export default {
     m = path.match(/^\/stream\/2dhive\/download\/(\d+)\/(sub|dub)\/(\d+)\/?$/);
     if (m) return dhiveHandler.fetch(request);
 
+    // Proxy genérico de stream (HLS/MP4/legendas) para players web.
+    // CDNs bloqueiam CORS por origin e/ou IPs de serverless — como este
+    // servidor já acessa essas CDNs no scrape, ele repassa com Referer e CORS *.
+    // Uso: GET /p?u=<url>&ref=<referer-opcional>
+    // Playlists .m3u8 são reescritas para continuarem passando por aqui.
+    if (path.match(/^\/p\/?$/)) {
+      return proxyStream(request);
+    }
+
     return json({
       name: "Anivexa API 2.2.1",
       cache: _CACHE_ENABLED,
@@ -310,6 +407,7 @@ export default {
         "/map/:anilistId",
         "/episodes/:anilistId",
         "/episodes/:provider[/:provider...]/:anilistId?map=true|false",
+        "/p?u=<url>&ref=<referer> (proxy de stream HLS/MP4 com CORS)",
         "/watch/mkissa/:id/sub|dub/mkissa-:ep",
         "/watch/reanime/:id/sub|dub/reanime-:ep",
         "/stream/reanime/:id/sub|dub/:ep",
