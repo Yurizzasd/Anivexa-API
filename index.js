@@ -154,16 +154,19 @@ async function proxyStream(request) {
     const looksSubs = /\.(ass|ssa|srt|vtt)($|\?)/i.test(upPath);
 
     // Playlist: reescreve para manter tudo dentro do proxy.
-    // Detecção por conteúdo também: nem toda playlist termina em .m3u8
-    // nem vem com content-type certo (segmentos quebrariam em 0:00).
-    if (looksPlaylist || looksSubs || (!/^(video|audio|image)\//i.test(contentType) && !/^application\/(mp4|octet-stream)/i.test(contentType))) {
+    // Detecção por CONTEÚDO: CDNs malucos servem .m3u8 até como image/jpeg,
+    // então content-type não é confiável. Bufferiza tudo que não for
+    // declaradamente vídeo/áudio nem maior que 1MB, e decide pelo conteúdo.
+    const len = Number(upstream.headers.get("Content-Length") || 0);
+    const isMedia = /^(video|audio)\//i.test(contentType);
+    if (!isMedia && !(len > 1024 * 1024)) {
       const buf = new Uint8Array(await upstream.arrayBuffer());
       let head = "";
       try {
         head = new TextDecoder().decode(buf.slice(0, 7));
       } catch {}
-      if (looksPlaylist || head.startsWith("#EXTM3U")) {
-        const text = new TextDecoder().decode(buf);
+      const text = head.startsWith("#EXTM3U") || looksPlaylist ? new TextDecoder().decode(buf) : null;
+      if (text && (looksPlaylist || head.startsWith("#EXTM3U"))) {
         outHeaders["Content-Type"] = "application/vnd.apple.mpegurl";
         return new Response(proxyPlaylist(text, upstreamUrl.toString(), selfBase, ref), {
           status: 200,
@@ -171,16 +174,12 @@ async function proxyStream(request) {
         });
       }
       if (looksSubs || /\.(ass|ssa|srt)($|\?)/i.test(upPath)) {
-        const text = new TextDecoder().decode(buf);
-        const vtt = /\.srt($|\?)/i.test(upPath) ? srtToVtt(text) : assToVtt(text);
+        const t = new TextDecoder().decode(buf);
+        const vtt = /\.srt($|\?)/i.test(upPath) ? srtToVtt(t) : assToVtt(t);
         if (vtt) {
           outHeaders["Content-Type"] = "text/vtt;charset=utf-8";
           return new Response(vtt, { status: 200, headers: outHeaders });
         }
-        // Conversão falhou: devolve o original mesmo assim.
-        const v = upstream.headers.get("Content-Type");
-        if (v) outHeaders["Content-Type"] = v;
-        return new Response(buf, { status: upstream.status, headers: outHeaders });
       }
       // Texto genérico pequeno (chaves, etc.): repassa com CORS.
       const v = upstream.headers.get("Content-Type");
