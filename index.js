@@ -103,7 +103,10 @@ async function proxyStream(request) {
       "Cache-Control": "public, max-age=60",
     };
     const contentType = upstream.headers.get("Content-Type") || "";
-    const selfBase = `${url.protocol}//${url.host}`;
+    // Sempre https em produção (o TLS termina no proxy do host).
+    // http:// explícito numa página https:// = mixed content bloqueado.
+    const isLocal = /^(localhost|127\.0\.0\.1)/i.test(url.host);
+    const selfBase = `${isLocal ? "http" : "https"}://${url.host}`;
     if (/mpegurl|vnd\.apple|x-mpegurl/i.test(contentType) || /\.m3u8($|\?)/i.test(upstreamUrl.pathname + upstreamUrl.search)) {
       const text = await upstream.text();
       outHeaders["Content-Type"] = "application/vnd.apple.mpegurl";
