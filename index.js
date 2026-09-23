@@ -36,8 +36,52 @@ function rewriteRequest(request, newPath) {
   return new Request(u.toString(), { method: request.method, headers: request.headers });
 }
 
-function proxyPlaylist(text, base, selfBase, ref) {
-  const abs = (uri) => {
+// Legendas ASS/SSA/SRT -> WebVTT (o <track> do navegador só entende VTT).
+function assTimeToVtt(t) {
+  const m = String(t || "").trim().match(/^(?:(\d+):)?(\d{1,2}):(\d{2})[.:](\d{1,3})$/);
+  if (!m) return null;
+  const h = Number(m[1] || 0);
+  const mm = String(m[2]).padStart(2, "0");
+  const ss = String(m[3]).padStart(2, "0");
+  const ms = String(m[4]).padEnd(3, "0").slice(0, 3);
+  return `${String(h).padStart(2, "0")}:${mm}:${ss}.${ms}`;
+}
+
+function cleanAssText(t) {
+  return String(t || "")
+    .replace(/\{[^}]*\}/g, "")
+    .replace(/\\N|\\n/g, "\n")
+    .replace(/\\h/g, " ")
+    .trim();
+}
+
+function assToVtt(text) {
+  const cues = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    if (!line.startsWith("Dialogue:")) continue;
+    const parts = line.slice(9).split(",");
+    if (parts.length < 10) continue;
+    const start = assTimeToVtt(parts[1]);
+    const end = assTimeToVtt(parts[2]);
+    const body = cleanAssText(parts.slice(9).join(","));
+    if (!start || !end || !body) continue;
+    cues.push(`${start} --> ${end}\n${body}`);
+  }
+  if (!cues.length) return null;
+  return `WEBVTT\n\n${cues.join("\n\n")}\n`;
+}
+
+function srtToVtt(text) {
+  const body = String(text).replace(/\r/g, "").trim();
+  if (!body) return null;
+  const out = body
+    .split("\n\n")
+    .map((block) => block.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2"))
+    .join("\n\n");
+  return `WEBVTT\n\n${out}\n`;
+}
+
+function proxyPlaylist(text, base, selfBase, ref) {  const abs = (uri) => {
     try {
       return new URL(uri, base).toString();
     } catch {
@@ -103,17 +147,45 @@ async function proxyStream(request) {
       "Cache-Control": "public, max-age=60",
     };
     const contentType = upstream.headers.get("Content-Type") || "";
-    // Sempre https em produção (o TLS termina no proxy do host).
-    // http:// explícito numa página https:// = mixed content bloqueado.
     const isLocal = /^(localhost|127\.0\.0\.1)/i.test(url.host);
     const selfBase = `${isLocal ? "http" : "https"}://${url.host}`;
-    if (/mpegurl|vnd\.apple|x-mpegurl/i.test(contentType) || /\.m3u8($|\?)/i.test(upstreamUrl.pathname + upstreamUrl.search)) {
-      const text = await upstream.text();
-      outHeaders["Content-Type"] = "application/vnd.apple.mpegurl";
-      return new Response(proxyPlaylist(text, upstreamUrl.toString(), selfBase, ref), {
-        status: 200,
-        headers: outHeaders,
-      });
+    const upPath = `${upstreamUrl.pathname}${upstreamUrl.search}`;
+    const looksPlaylist = /mpegurl|vnd\.apple|x-mpegurl/i.test(contentType) || /\.m3u8($|\?)/i.test(upPath);
+    const looksSubs = /\.(ass|ssa|srt|vtt)($|\?)/i.test(upPath);
+
+    // Playlist: reescreve para manter tudo dentro do proxy.
+    // Detecção por conteúdo também: nem toda playlist termina em .m3u8
+    // nem vem com content-type certo (segmentos quebrariam em 0:00).
+    if (looksPlaylist || looksSubs || (!/^(video|audio|image)\//i.test(contentType) && !/^application\/(mp4|octet-stream)/i.test(contentType))) {
+      const buf = new Uint8Array(await upstream.arrayBuffer());
+      let head = "";
+      try {
+        head = new TextDecoder().decode(buf.slice(0, 7));
+      } catch {}
+      if (looksPlaylist || head.startsWith("#EXTM3U")) {
+        const text = new TextDecoder().decode(buf);
+        outHeaders["Content-Type"] = "application/vnd.apple.mpegurl";
+        return new Response(proxyPlaylist(text, upstreamUrl.toString(), selfBase, ref), {
+          status: 200,
+          headers: outHeaders,
+        });
+      }
+      if (looksSubs || /\.(ass|ssa|srt)($|\?)/i.test(upPath)) {
+        const text = new TextDecoder().decode(buf);
+        const vtt = /\.srt($|\?)/i.test(upPath) ? srtToVtt(text) : assToVtt(text);
+        if (vtt) {
+          outHeaders["Content-Type"] = "text/vtt;charset=utf-8";
+          return new Response(vtt, { status: 200, headers: outHeaders });
+        }
+        // Conversão falhou: devolve o original mesmo assim.
+        const v = upstream.headers.get("Content-Type");
+        if (v) outHeaders["Content-Type"] = v;
+        return new Response(buf, { status: upstream.status, headers: outHeaders });
+      }
+      // Texto genérico pequeno (chaves, etc.): repassa com CORS.
+      const v = upstream.headers.get("Content-Type");
+      if (v) outHeaders["Content-Type"] = v;
+      return new Response(buf, { status: upstream.status, headers: outHeaders });
     }
     for (const h of ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"]) {
       const v = upstream.headers.get(h);
